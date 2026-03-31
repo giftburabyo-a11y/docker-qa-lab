@@ -17,7 +17,6 @@ public class CheckoutTest extends BaseTest {
 
     private JavascriptExecutor js;
 
-    // Properly triggers React's controlled input onChange using the native setter
     private void fillField(String id, String value) {
         WebElement field = driver.findElement(By.id(id));
         js.executeScript(
@@ -32,12 +31,20 @@ public class CheckoutTest extends BaseTest {
     @BeforeEach
     public void loginAndAddItem() {
         js = (JavascriptExecutor) driver;
+        WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(15));
+
         driver.get(BASE_URL);
         driver.findElement(By.id("user-name")).sendKeys(USERNAME);
         driver.findElement(By.id("password")).sendKeys(PASSWORD);
         driver.findElement(By.id("login-button")).click();
-        driver.findElement(By.cssSelector(".inventory_item button")).click();
+
+        wait.until(ExpectedConditions.urlContains("/inventory.html"));
+        wait.until(ExpectedConditions.visibilityOfElementLocated(
+                By.cssSelector(".inventory_item button"))).click();
+
         driver.findElement(By.className("shopping_cart_link")).click();
+        wait.until(ExpectedConditions.urlContains("/cart.html"));
+        wait.until(ExpectedConditions.visibilityOfElementLocated(By.id("checkout")));
     }
 
     @Test
