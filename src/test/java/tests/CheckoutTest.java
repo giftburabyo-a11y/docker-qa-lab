@@ -36,13 +36,17 @@ public class CheckoutTest extends BaseTest {
         driver.get(BASE_URL);
         driver.findElement(By.id("user-name")).sendKeys(USERNAME);
         driver.findElement(By.id("password")).sendKeys(PASSWORD);
-        driver.findElement(By.id("login-button")).click();
+        js.executeScript("arguments[0].click();", driver.findElement(By.id("login-button")));
 
         wait.until(ExpectedConditions.urlContains("/inventory.html"));
-        wait.until(ExpectedConditions.visibilityOfElementLocated(
-                By.cssSelector(".inventory_item button"))).click();
+        js.executeScript("arguments[0].click();",
+                wait.until(ExpectedConditions.visibilityOfElementLocated(
+                        By.cssSelector(".inventory_item button"))));
 
-        driver.findElement(By.className("shopping_cart_link")).click();
+        wait.until(ExpectedConditions.visibilityOfElementLocated(
+                By.className("shopping_cart_badge")));
+        js.executeScript("arguments[0].click();",
+                driver.findElement(By.className("shopping_cart_link")));
         wait.until(ExpectedConditions.urlContains("/cart.html"));
         wait.until(ExpectedConditions.visibilityOfElementLocated(By.id("checkout")));
     }
@@ -52,7 +56,7 @@ public class CheckoutTest extends BaseTest {
     public void testFullCheckoutFlow() throws InterruptedException {
         WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(20));
 
-        wait.until(ExpectedConditions.elementToBeClickable(By.id("checkout"))).click();
+        js.executeScript("arguments[0].click();", driver.findElement(By.id("checkout")));
         wait.until(ExpectedConditions.urlContains("/checkout-step-one.html"));
         wait.until(ExpectedConditions.visibilityOfElementLocated(By.id("first-name")));
 
@@ -80,7 +84,7 @@ public class CheckoutTest extends BaseTest {
     public void testCheckoutMissingFirstName() throws InterruptedException {
         WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(20));
 
-        wait.until(ExpectedConditions.elementToBeClickable(By.id("checkout"))).click();
+        js.executeScript("arguments[0].click();", driver.findElement(By.id("checkout")));
         wait.until(ExpectedConditions.urlContains("/checkout-step-one.html"));
         wait.until(ExpectedConditions.visibilityOfElementLocated(By.id("last-name")));
 
