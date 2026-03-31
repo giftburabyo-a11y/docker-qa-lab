@@ -5,6 +5,10 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.openqa.selenium.By;
 import org.openqa.selenium.WebElement;
+import org.openqa.selenium.support.ui.ExpectedConditions;
+import org.openqa.selenium.support.ui.WebDriverWait;
+
+import java.time.Duration;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -69,7 +73,12 @@ public class CartTest extends BaseTest {
         // Remove the item
         driver.findElement(By.cssSelector(".cart_item button")).click();
 
-        // Badge should be gone (no element present)
+        // Wait up to 5 seconds for the badge to disappear
+        WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(5));
+        wait.until(ExpectedConditions.invisibilityOfElementLocated(
+                By.className("shopping_cart_badge")));
+
+        // Badge should be gone
         assertTrue(driver.findElements(By.className("shopping_cart_badge")).isEmpty(),
                 "Cart badge should disappear after removing the only item");
     }
