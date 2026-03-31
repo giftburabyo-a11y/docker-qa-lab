@@ -1,0 +1,39 @@
+name: Docker QA Tests
+
+# Trigger: run on every push and pull request to main
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Build & Run Tests in Docker
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Check out the repository code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Build the Docker image from our Dockerfile
+      #    -t gives it a name/tag so we can reference it in the next step
+      - name: Build Docker image
+        run: docker build -t docker-qa-lab:latest .
+
+      # 3. Run the container — Maven executes mvn test inside it
+      #    --rm removes the container automatically after it exits
+      - name: Run tests inside Docker container
+        run: docker run --rm docker-qa-lab:latest
+
+      # 4. (Optional) Upload Surefire test reports as a build artifact
+      #    so you can download and read them from the Actions UI
+      - name: Upload test reports
+        if: always()   # run even if tests failed so we can see the report
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: |
+            **/target/surefire-reports/*.xml
+            **/target/surefire-reports/*.txt
