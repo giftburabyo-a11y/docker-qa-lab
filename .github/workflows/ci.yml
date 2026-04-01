@@ -1,11 +1,11 @@
 name: Docker QA Tests
 
-# Trigger: run on every push and pull request to main
 on:
   push:
-    branches: [ master ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ master ]
+    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   test:
@@ -13,27 +13,51 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Check out the repository code
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Build the Docker image from our Dockerfile
-      #    -t gives it a name/tag so we can reference it in the next step
       - name: Build Docker image
         run: docker build -t docker-qa-lab:latest .
 
-      # 3. Run the container — Maven executes mvn test inside it
-      #    --rm removes the container automatically after it exits
       - name: Run tests inside Docker container
         run: docker run --rm docker-qa-lab:latest
 
-      # 4. (Optional) Upload Surefire test reports as a build artifact
-      #    so you can download and read them from the Actions UI
       - name: Upload test reports
-        if: always()   # run even if tests failed so we can see the report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: surefire-reports
           path: |
             **/target/surefire-reports/*.xml
             **/target/surefire-reports/*.txt
+
+      - name: Send Slack notification
+        if: always()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "*Docker QA Tests* — ${{ job.status == 'success' && '✅ PASSED' || '❌ FAILED' }}\n*Repo:* ${{ github.repository }}\n*Branch:* ${{ github.ref_name }}\n*Commit:* ${{ github.sha }}\n*Run:* ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Send Email notification
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "Docker QA Tests — ${{ job.status }}"
+          to: ${{ secrets.EMAIL_USERNAME }}
+          from: ${{ secrets.EMAIL_USERNAME }}
+          body: |
+            Docker QA Test Results
+            Status: ${{ job.status }}
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+            View run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
