@@ -49,11 +49,11 @@ jobs:
         with:
           server_address: smtp.gmail.com
           server_port: 465
-          username: ${{ secrets.EMAIL_USERNAME }}
-          password: ${{ secrets.EMAIL_PASSWORD }}
+          username: ${{ secrets.GMAIL_ADRESS }}
+          password: ${{ secrets.GMAIL_APP_PASS }}
           subject: "Docker QA Tests — ${{ job.status }}"
-          to: ${{ secrets.EMAIL_USERNAME }}
-          from: ${{ secrets.EMAIL_USERNAME }}
+          to: ${{ secrets.REPORT_EMAIL }}
+          from: ${{ secrets.GMAIL_USERNAME }}
           body: |
             Docker QA Test Results
             Status: ${{ job.status }}
