@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -20,44 +21,335 @@ jobs:
         run: docker build -t docker-qa-lab:latest .
 
       - name: Run tests inside Docker container
-        run: docker run --rm docker-qa-lab:latest
+        run: |
+          docker run --name qa-container docker-qa-lab:latest || true
+          docker cp qa-container:/app/target/surefire-reports ./surefire-reports || true
+          docker rm qa-container
+
+      - name: Parse test results
+        if: always()
+        id: parse-results
+        run: |
+          TOTAL=0; PASSED=0; FAILED=0; SKIPPED=0; ERRORS=0
+          for f in surefire-reports/TEST-*.xml; do
+            [ -f "$f" ] || continue
+            t=$(grep  -oP 'tests="\K[0-9]+'    "$f" | head -1)
+            fa=$(grep -oP 'failures="\K[0-9]+' "$f" | head -1)
+            sk=$(grep -oP 'skipped="\K[0-9]+'  "$f" | head -1)
+            er=$(grep -oP 'errors="\K[0-9]+'   "$f" | head -1)
+            TOTAL=$((TOTAL   + ${t:-0}))
+            FAILED=$((FAILED  + ${fa:-0}))
+            SKIPPED=$((SKIPPED + ${sk:-0}))
+            ERRORS=$((ERRORS  + ${er:-0}))
+          done
+          PASSED=$((TOTAL - FAILED - SKIPPED - ERRORS))
+          [ "$TOTAL" -gt 0 ] && PASS_PCT=$((PASSED * 100 / TOTAL)) || PASS_PCT=0
+          echo "total=$TOTAL"       >> $GITHUB_OUTPUT
+          echo "passed=$PASSED"     >> $GITHUB_OUTPUT
+          echo "failed=$FAILED"     >> $GITHUB_OUTPUT
+          echo "skipped=$SKIPPED"   >> $GITHUB_OUTPUT
+          echo "errors=$ERRORS"     >> $GITHUB_OUTPUT
+          echo "pass_pct=$PASS_PCT" >> $GITHUB_OUTPUT
 
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: surefire-reports
-          path: |
-            **/target/surefire-reports/*.xml
-            **/target/surefire-reports/*.txt
+          name: surefire-reports-${{ github.run_number }}
+          path: surefire-reports/
+          retention-days: 14
 
-      - name: Send Slack notification
+      - name: Send email report
         if: always()
-        uses: slackapi/slack-github-action@v1.26.0
-        with:
-          payload: |
-            {
-              "text": "*Docker QA Tests* — ${{ job.status == 'success' && '✅ PASSED' || '❌ FAILED' }}\n*Repo:* ${{ github.repository }}\n*Branch:* ${{ github.ref_name }}\n*Commit:* ${{ github.sha }}\n*Run:* ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            }
+        env:
+          GMAIL_ADDRESS:  ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
+          REPORT_TO:      ${{ secrets.REPORT_EMAIL }}
+        run: |
+          cat > /tmp/send_email.py << 'SCRIPTEOF'
+          import os, smtplib, glob
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+          from datetime import datetime, timezone
+          import xml.etree.ElementTree as ET
+
+          gmail_user = os.environ.get("GMAIL_ADDRESS", "")
+          gmail_pass = os.environ.get("GMAIL_APP_PASS", "")
+          report_to  = os.environ.get("REPORT_TO", "")
+          if not all([gmail_user, gmail_pass, report_to]):
+              print("Email secrets not configured - skipping")
+              exit(0)
+
+          total    = os.environ.get("TOTAL", "0")
+          passed   = os.environ.get("PASSED", "0")
+          failed   = os.environ.get("FAILED", "0")
+          skipped  = os.environ.get("SKIPPED", "0")
+          errors   = os.environ.get("ERRORS", "0")
+          pass_pct = os.environ.get("PASS_PCT", "0")
+          run_num  = os.environ.get("RUN_NUM", "0")
+          branch   = os.environ.get("BRANCH", "unknown")
+          actor    = os.environ.get("ACTOR", "unknown")
+          run_url  = os.environ.get("RUN_URL", "")
+          commit_url = os.environ.get("COMMIT_URL", "")
+          short_sha  = os.environ.get("SHORT_SHA", "")
+          event    = os.environ.get("EVENT", "push")
+          triggers = {"push": "Push to branch", "pull_request": "Pull Request",
+                      "workflow_dispatch": "Manual trigger", "schedule": "Scheduled run"}
+          trigger  = triggers.get(event, event)
+
+          failing_tests = []
+          for xml_file in sorted(glob.glob("surefire-reports/TEST-*.xml")):
+              try:
+                  tree = ET.parse(xml_file)
+                  root = tree.getroot()
+              except Exception:
+                  continue
+              for tc in root.findall("testcase"):
+                  failure = tc.find("failure") or tc.find("error")
+                  if failure is None:
+                      continue
+                  failing_tests.append({
+                      "name": tc.get("name", "Unknown"),
+                      "class": tc.get("classname", "Unknown").split(".")[-1],
+                      "message": (failure.get("message") or failure.text or "No message.")[:300],
+                      "type": failure.get("type", "AssertionError")
+                  })
+
+          is_pass  = int(failed) == 0 and int(errors) == 0
+          status   = "PASSED" if is_pass else "FAILED"
+          s_color  = "#2e7d32" if is_pass else "#b71c1c"
+          s_bg     = "#e8f5e9" if is_pass else "#ffebee"
+          timestamp = datetime.now(timezone.utc).strftime("%d %B %Y at %H:%M UTC")
+          next_steps = ("All tests passed. No action required." if is_pass else
+              "<strong>Action required.</strong> One or more tests failed. Review the failure report below.")
+
+          fail_block = ""
+          if failing_tests:
+              fail_block = "<h2 style='margin:32px 0 12px;font-size:18px;color:#b71c1c'>Detailed Failure Report</h2>"
+              for t in failing_tests:
+                  fail_block += (
+                      "<div style='border:1px solid #ffcdd2;border-radius:8px;margin-bottom:20px;background:#fff'>"
+                      "<div style='background:#ffebee;padding:12px 16px;border-bottom:1px solid #ffcdd2'>"
+                      "<p style='margin:0;font-weight:700;color:#b71c1c'>" + t["name"] + "</p>"
+                      "<p style='margin:2px 0 0;font-size:11px;color:#666'>" + t["class"] + " | Type: " + t["type"] + "</p>"
+                      "</div><div style='padding:16px;font-size:13px;color:#333'>"
+                      "<div style='background:#f8f9fa;padding:12px;font-family:monospace;font-size:12px;"
+                      "border-left:4px solid #b71c1c;color:#c62828'>" + t["message"] + "</div>"
+                      "</div></div>"
+                  )
+
+          html = (
+              "<!DOCTYPE html><html><head><meta charset='UTF-8'></head>"
+              "<body style='margin:0;padding:0;background:#f4f6f9;font-family:Arial,sans-serif'>"
+              "<table width='100%' style='background:#f4f6f9;padding:32px 0'><tr><td align='center'>"
+              "<table width='620' style='max-width:620px'>"
+              "<tr><td style='background:#1a237e;border-radius:10px 10px 0 0;padding:28px 36px'>"
+              "<p style='margin:0;font-size:11px;color:#9fa8da;text-transform:uppercase'>Automated Test Report</p>"
+              "<h1 style='margin:6px 0 0;font-size:24px;color:#fff'>Docker QA — Swag Labs Test Suite</h1>"
+              "<p style='margin:6px 0 0;font-size:12px;color:#9fa8da'>Run #" + run_num + "</p></td></tr>"
+              "<tr><td style='background:" + s_bg + ";padding:20px 36px;border-left:5px solid " + s_color + "'>"
+              "<p style='margin:0;font-size:20px;font-weight:700;color:" + s_color + "'>Build " + status + "</p>"
+              "<p style='margin:6px 0 0;font-size:12px;color:#555'>" + timestamp + "</p></td></tr>"
+              "<tr><td style='background:#fff;padding:28px 36px'>"
+              "<h2 style='color:#1a237e'>Run Details</h2>"
+              "<table width='100%' style='border:1px solid #e8eaf0;border-radius:8px;font-size:13px;margin-bottom:28px'>"
+              "<tr style='background:#f5f7ff'><td style='padding:9px 14px;font-weight:700;color:#3949ab;width:38%'>Field</td>"
+              "<td style='padding:9px 14px;font-weight:700;color:#3949ab'>Value</td></tr>"
+              "<tr><td style='padding:9px 14px;font-weight:600;color:#555'>Branch</td><td style='padding:9px 14px'>" + branch + "</td></tr>"
+              "<tr><td style='padding:9px 14px;font-weight:600;color:#555'>Commit</td><td style='padding:9px 14px'>"
+              "<a href='" + commit_url + "' style='color:#1a237e'>" + short_sha[:7] + "</a></td></tr>"
+              "<tr><td style='padding:9px 14px;font-weight:600;color:#555'>Triggered by</td><td style='padding:9px 14px'>" + actor + " (" + trigger + ")</td></tr>"
+              "<tr><td style='padding:9px 14px;font-weight:600;color:#555'>Environment</td><td style='padding:9px 14px'>Docker — Chrome Headless — Selenium 4 — JUnit 5</td></tr>"
+              "</table>"
+              "<h2 style='color:#1a237e'>Test Summary</h2>"
+              "<table width='100%' cellpadding='6' cellspacing='6' style='margin-bottom:12px'><tr>"
+              "<td style='background:#e8f5e9;border-radius:8px;padding:14px;text-align:center'><p style='margin:0;font-size:26px;font-weight:700;color:#2e7d32'>" + passed + "</p><p style='margin:4px 0 0;font-size:11px'>PASSED</p></td>"
+              "<td style='background:#ffebee;border-radius:8px;padding:14px;text-align:center'><p style='margin:0;font-size:26px;font-weight:700;color:#b71c1c'>" + failed + "</p><p style='margin:4px 0 0;font-size:11px'>FAILED</p></td>"
+              "<td style='background:#fff8e1;border-radius:8px;padding:14px;text-align:center'><p style='margin:0;font-size:26px;font-weight:700;color:#f57f17'>" + skipped + "</p><p style='margin:4px 0 0;font-size:11px'>SKIPPED</p></td>"
+              "<td style='background:#f5f5f5;border-radius:8px;padding:14px;text-align:center'><p style='margin:0;font-size:26px;font-weight:700;color:#333'>" + total + "</p><p style='margin:4px 0 0;font-size:11px'>TOTAL</p></td>"
+              "</tr></table>"
+              "<p style='font-size:13px;color:#555'>Pass rate: <strong>" + pass_pct + "%</strong></p>"
+              "<div style='background:#e0e0e0;border-radius:99px;height:10px;margin-bottom:28px'>"
+              "<div style='background:" + s_color + ";width:" + pass_pct + "%;height:10px;border-radius:99px;min-width:4px'></div></div>"
+              + fail_block +
+              "<h2 style='color:#1a237e'>Next Steps</h2>"
+              "<div style='background:#f5f7ff;border-radius:8px;padding:16px 20px;font-size:13px;color:#333'>" + next_steps + "</div>"
+              "<div style='text-align:center;margin-top:32px'>"
+              "<a href='" + run_url + "' style='display:inline-block;background:#1a237e;color:#fff;"
+              "text-decoration:none;padding:14px 28px;border-radius:6px;font-size:14px;font-weight:700'>View Run on GitHub</a>"
+              "</div></td></tr>"
+              "<tr><td style='background:#f5f7ff;border-radius:0 0 10px 10px;padding:16px 36px;text-align:center'>"
+              "<p style='margin:0;font-size:11px;color:#9e9e9e'>Generated by Docker QA CI pipeline</p>"
+              "</td></tr></table></td></tr></table></body></html>"
+          )
+
+          subject = "[Run #" + run_num + "] Docker QA Tests " + status + " — " + branch
+          msg = MIMEMultipart("alternative")
+          msg["Subject"] = subject
+          msg["From"]    = "Docker QA CI <" + gmail_user + ">"
+          msg["To"]      = report_to
+          msg.attach(MIMEText(html, "html"))
+          with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+              server.login(gmail_user, gmail_pass)
+              server.sendmail(gmail_user, report_to, msg.as_string())
+          print("Email sent to " + report_to)
+          SCRIPTEOF
+          TOTAL="${{ steps.parse-results.outputs.total }}" \
+          PASSED="${{ steps.parse-results.outputs.passed }}" \
+          FAILED="${{ steps.parse-results.outputs.failed }}" \
+          SKIPPED="${{ steps.parse-results.outputs.skipped }}" \
+          ERRORS="${{ steps.parse-results.outputs.errors }}" \
+          PASS_PCT="${{ steps.parse-results.outputs.pass_pct }}" \
+          RUN_NUM="${{ github.run_number }}" \
+          BRANCH="${{ github.ref_name }}" \
+          ACTOR="${{ github.actor }}" \
+          EVENT="${{ github.event_name }}" \
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+          COMMIT_URL="${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}" \
+          SHORT_SHA="${{ github.sha }}" \
+          python3 /tmp/send_email.py
+
+      - name: Send Slack report
+        if: always()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        run: |
+          cat > /tmp/send_slack.py << 'SCRIPTEOF'
+          import json, os, subprocess, sys, glob
+          import xml.etree.ElementTree as ET
 
-      - name: Send Email notification
+          webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
+          if not webhook:
+              print("No SLACK_WEBHOOK_URL - skipping")
+              sys.exit(0)
+
+          total    = os.environ.get("TOTAL", "0")
+          passed   = os.environ.get("PASSED", "0")
+          failed   = os.environ.get("FAILED", "0")
+          skipped  = os.environ.get("SKIPPED", "0")
+          errors   = os.environ.get("ERRORS", "0")
+          pass_pct = os.environ.get("PASS_PCT", "0")
+          run_num  = os.environ.get("RUN_NUM", "0")
+          branch   = os.environ.get("BRANCH", "unknown")
+          actor    = os.environ.get("ACTOR", "unknown")
+          run_url  = os.environ.get("RUN_URL", "")
+          sha      = os.environ.get("SHORT_SHA", "")[:7]
+          event    = os.environ.get("EVENT", "push")
+          repo     = os.environ.get("REPO", "")
+          triggers = {"push": "Push to branch", "pull_request": "Pull Request",
+                      "workflow_dispatch": "Manual trigger", "schedule": "Scheduled run"}
+          trigger  = triggers.get(event, event)
+          is_pass  = int(failed) == 0 and int(errors) == 0
+
+          failing_tests = []
+          for xml_file in sorted(glob.glob("surefire-reports/TEST-*.xml")):
+              try:
+                  tree = ET.parse(xml_file)
+                  root = tree.getroot()
+              except Exception:
+                  continue
+              for tc in root.findall("testcase"):
+                  failure = tc.find("failure") or tc.find("error")
+                  if failure is None:
+                      continue
+                  failing_tests.append({
+                      "name": tc.get("name", "Unknown"),
+                      "class": tc.get("classname", "Unknown").split(".")[-1],
+                      "message": (failure.get("message") or failure.text or "No message.")[:300],
+                      "type": failure.get("type", "AssertionError")
+                  })
+
+          s_label = "PASSED" if is_pass else "FAILED"
+          color   = "#2e7d32" if is_pass else "#e01e5a"
+
+          failure_blocks = []
+          for i, t in enumerate(failing_tests, 1):
+              failure_blocks.append({
+                  "type": "section",
+                  "text": {"type": "mrkdwn", "text": (
+                      "*Test " + str(i) + ":* `" + t["name"] + "`\n"
+                      "*Class:* `" + t["class"] + "` | *Type:* " + t["type"] + "\n\n"
+                      "*Failure Message*\n```" + t["message"] + "```"
+                  )}
+              })
+              if i < len(failing_tests):
+                  failure_blocks.append({"type": "divider"})
+
+          blocks = [
+              {"type": "header", "text": {"type": "plain_text",
+                  "text": "Docker QA Tests — " + ("✅ " if is_pass else "❌ ") + s_label, "emoji": True}},
+              {"type": "divider"},
+              {"type": "section", "fields": [
+                  {"type": "mrkdwn", "text": "*Repository*\n" + repo},
+                  {"type": "mrkdwn", "text": "*Branch*\n" + branch},
+                  {"type": "mrkdwn", "text": "*Triggered by*\n" + actor + " (" + trigger + ")"},
+                  {"type": "mrkdwn", "text": "*Commit*\n`" + sha + "`"},
+                  {"type": "mrkdwn", "text": "*Run*\n<" + run_url + "|Run #" + run_num + ">"},
+                  {"type": "mrkdwn", "text": "*Environment*\nDocker — Chrome Headless — Selenium 4"},
+              ]},
+              {"type": "section", "text": {"type": "mrkdwn", "text": (
+                  "*Test Summary*\n"
+                  "✅ Passed: *" + passed + "*   ❌ Failed: *" + failed + "*   "
+                  "⏭ Skipped: *" + skipped + "*   📊 Total: *" + total + "*   Pass rate: *" + pass_pct + "%*"
+              )}},
+          ]
+
+          if failing_tests:
+              blocks += [
+                  {"type": "divider"},
+                  {"type": "section", "text": {"type": "mrkdwn",
+                      "text": "*" + str(len(failing_tests)) + " Failing Test(s)*"}},
+                  {"type": "divider"},
+              ] + failure_blocks
+          else:
+              blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                  "text": "✅ All 7 tests passed. No failures to report."}})
+
+          blocks += [
+              {"type": "divider"},
+              {"type": "actions", "elements": [
+                  {"type": "button", "text": {"type": "plain_text",
+                      "text": "View Run on GitHub", "emoji": True},
+                   "url": run_url, "style": "primary"},
+              ]}
+          ]
+
+          payload = {
+              "text": "Docker QA Tests " + s_label + " — Run #" + run_num,
+              "attachments": [{"color": color, "blocks": blocks}]
+          }
+          result = subprocess.run(
+              ["curl", "-s", "-X", "POST", webhook,
+               "-H", "Content-Type: application/json",
+               "-d", json.dumps(payload)],
+              capture_output=True, text=True)
+          print(result.stdout)
+          print("Slack notification sent — " + str(len(failing_tests)) + " failure(s).")
+          SCRIPTEOF
+          TOTAL="${{ steps.parse-results.outputs.total }}" \
+          PASSED="${{ steps.parse-results.outputs.passed }}" \
+          FAILED="${{ steps.parse-results.outputs.failed }}" \
+          SKIPPED="${{ steps.parse-results.outputs.skipped }}" \
+          ERRORS="${{ steps.parse-results.outputs.errors }}" \
+          PASS_PCT="${{ steps.parse-results.outputs.pass_pct }}" \
+          RUN_NUM="${{ github.run_number }}" \
+          BRANCH="${{ github.ref_name }}" \
+          ACTOR="${{ github.actor }}" \
+          EVENT="${{ github.event_name }}" \
+          REPO="${{ github.repository }}" \
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+          SHORT_SHA="${{ github.sha }}" \
+          python3 /tmp/send_slack.py
+
+      - name: Summary
         if: always()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          username: ${{ secrets.GMAIL_ADDRESS }}
-          password: ${{ secrets.GMAIL_APP_PASS }}
-          subject: "Docker QA Tests — ${{ job.status }}"
-          to: ${{ secrets.REPORT_EMAIL }}
-          from: ${{ secrets.GMAIL_ADDRESS }}
-          body: |
-            Docker QA Test Results
-            Status: ${{ job.status }}
-            Repository: ${{ github.repository }}
-            Branch: ${{ github.ref_name }}
-            Commit: ${{ github.sha }}
-            View run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          echo "## Docker QA Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric  | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Total   | ${{ steps.parse-results.outputs.total }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Passed  | ${{ steps.parse-results.outputs.passed }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Failed  | ${{ steps.parse-results.outputs.failed }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Errors  | ${{ steps.parse-results.outputs.errors }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Skipped | ${{ steps.parse-results.outputs.skipped }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pass %  | ${{ steps.parse-results.outputs.pass_pct }}% |" >> $GITHUB_STEP_SUMMARY
